@@ -1,24 +1,55 @@
 <script>
-    import { onMount, createEventDispatcher } from 'svelte';
+    import { onMount, onDestroy, createEventDispatcher } from 'svelte';
     import { chapters } from './routes.js';
 
     const dispatch = createEventDispatcher();
     let map;
+    const ROUTE_LAYER_ID = 'routes-johnny';
+    const ROUTE_COLOR = '#008566';
+    const EXPLORE_LAYER_IDS = ['lines', 'SBB'];
+    const MAX_ROUTE_INCREMENT = Math.max(
+        1,
+        ...Object.values(chapters).map((chapter) => chapter.maxRouteIncrement ?? 0)
+    );
     let currentChapter = 'position-0';
     let lastScrollStep = null;
     let scrollDebounceTimer = null;
     let navigationControl = null;
     let lastTextboxObserver = null;
+    let currentMaxIncrement = 0;
+    let routeLayerReady = false;
+    let routeAnimationFrame = null;
+    let canUseLineGradient = false;
+    const pendingLayerVisibility = new Map();
+
+    export function setLayerVisibility(layerId, visible) {
+        pendingLayerVisibility.set(layerId, visible);
+        applyLayerVisibility(layerId, visible);
+    }
 
     async function initializeMap() {
         window.maptilersdk.config.apiKey = 'L1pxMIEc78RDmw6G2tIP';
 
+        // Get initial position from chapters
+        const initialChapter = chapters['position-0'];
+
+        const isMobileDevice = window.innerWidth <= 768;
+        const overviewChapter = chapters['position-4'];
+        const overviewMobileZoom = overviewChapter?.zoom ?? 7;
+        const overviewDesktopZoom = overviewChapter?.zoomDesktop ?? overviewMobileZoom;
+        const minZoom = isMobileDevice ? overviewMobileZoom : overviewDesktopZoom;
+        const initialZoom = isMobileDevice
+            ? initialChapter.zoom
+            : initialChapter.zoomDesktop ?? initialChapter.zoom;
+
         map = new window.maptilersdk.Map({
             container: 'map',
             style: '019a5809-86bc-788c-86bb-aed00df4c85d',
-            center: [8.5944, 46.6339], // Andermatt - Start high in the Alps
-            zoom: 12,
-            pitch: 60,
+            center: initialChapter.center,
+            zoom: initialZoom,
+            bearing: initialChapter.bearing,
+            pitch: initialChapter.pitch,
+            minZoom,
             maxPitch: 85,
             pitchWithRotate: true, // Enable right-click pitch control (desktop)
             touchPitch: true, // Enable two-finger pitch control (mobile)
@@ -34,18 +65,225 @@
         });
         map.addControl(navigationControl, 'top-right');
 
+        // Load and add routes GeoJSON
+        await ensureRouteLayer();
+        evaluateLineGradientSupport();
+        applyRouteStyling();
+        applyRouteFilter(0);
+        flushPendingLayerVisibility();
+
         dispatch('mapStatus', { type: 'load' });
         setupScrollytelling();
+
+        // Trigger initial route display after loader finishes.
+        if (initialChapter.maxRouteIncrement !== undefined) {
+            const initialRouteDelay = initialChapter.initialRouteDelay ?? 3000;
+            setTimeout(() => {
+                updateRoutesDisplay(initialChapter.maxRouteIncrement, {
+                    duration: initialChapter.routeAnimationDuration
+                });
+            }, initialRouteDelay);
+        }
+    }
+
+    async function ensureRouteLayer() {
+        if (map.getLayer(ROUTE_LAYER_ID)) {
+            routeLayerReady = true;
+            return;
+        }
+
+        await new Promise((resolve) => {
+            const onStyleData = () => {
+                if (map.getLayer(ROUTE_LAYER_ID)) {
+                    map.off('styledata', onStyleData);
+                    routeLayerReady = true;
+                    resolve();
+                }
+            };
+
+            map.on('styledata', onStyleData);
+        });
+    }
+
+    function evaluateLineGradientSupport() {
+        if (!map) {
+            return;
+        }
+        const source = map.getSource(ROUTE_LAYER_ID);
+        // line-progress only works for GeoJSON sources with lineMetrics enabled
+        if (source && source.type === 'geojson' && source.workerOptions?.lineMetrics) {
+            canUseLineGradient = true;
+        } else {
+            canUseLineGradient = false;
+            if (routeLayerReady && map.getLayer(ROUTE_LAYER_ID)) {
+                try {
+                    map.setPaintProperty(ROUTE_LAYER_ID, 'line-gradient', null);
+                } catch (error) {
+                    console.warn('Unable to reset line gradient:', error);
+                }
+            }
+        }
+    }
+
+    function createIncrementFilter(maxIncrement) {
+        const layerValue = ['coalesce', ['to-string', ['get', 'layer']], '0'];
+        const dashIndex = ['index-of', '-', layerValue];
+        const prefixLength = [
+            'case',
+            ['>=', dashIndex, 0],
+            dashIndex,
+            ['length', layerValue]
+        ];
+        const numericPrefix = ['to-number', ['slice', layerValue, 0, prefixLength]];
+
+        return [
+            'all',
+            ['<=', numericPrefix, maxIncrement]
+        ];
+    }
+
+    function applyRouteFilter(maxIncrement) {
+        if (!routeLayerReady || !map.getLayer(ROUTE_LAYER_ID)) {
+            return;
+        }
+
+        map.setFilter(ROUTE_LAYER_ID, createIncrementFilter(maxIncrement));
+        applyRouteStyling();
+        const normalizedProgress = Math.min(1, Math.max(0, maxIncrement) / MAX_ROUTE_INCREMENT);
+        applyLineGradient(normalizedProgress);
+    }
+
+    function updateRoutesDisplay(targetIncrement, options = {}) {
+        console.log('updateRoutesDisplay called with targetIncrement:', targetIncrement);
+
+        if (!routeLayerReady || !map.getLayer(ROUTE_LAYER_ID)) {
+            console.warn('routes-johnny layer not ready');
+            return;
+        }
+
+        const startIncrement = currentMaxIncrement;
+        const incrementDiff = targetIncrement - startIncrement;
+        const overrideDuration = options.duration;
+
+        console.log('Animation from', startIncrement, 'to', targetIncrement);
+
+        if (incrementDiff <= 0) {
+            currentMaxIncrement = targetIncrement;
+            applyRouteFilter(targetIncrement);
+            return;
+        }
+
+        if (routeAnimationFrame) {
+            cancelAnimationFrame(routeAnimationFrame);
+            routeAnimationFrame = null;
+        }
+
+        const isFirstSegment = startIncrement === 0;
+        const baseDuration = overrideDuration ?? (isFirstSegment ? 6000 : 2800);
+        const firstSegmentMultiplier = isFirstSegment ? 1.35 : 1;
+        const animationDuration = baseDuration * firstSegmentMultiplier;
+        const startTime = performance.now();
+
+        function animate(timestamp) {
+            const elapsed = timestamp - startTime;
+            const progress = Math.min(elapsed / animationDuration, 1);
+
+            const easedProgress = progress * progress * (3 - 2 * progress); // smoothstep
+            currentMaxIncrement = startIncrement + (incrementDiff * easedProgress);
+
+            applyRouteFilter(currentMaxIncrement);
+
+            if (progress < 1) {
+                routeAnimationFrame = requestAnimationFrame(animate);
+            } else {
+                currentMaxIncrement = targetIncrement;
+                applyRouteFilter(currentMaxIncrement);
+                routeAnimationFrame = null;
+                console.log('Animation complete, showing up to increment:', targetIncrement);
+            }
+        }
+
+        routeAnimationFrame = requestAnimationFrame(animate);
+    }
+
+    function applyLineGradient(progress) {
+        if (!canUseLineGradient || !routeLayerReady || !map.getLayer(ROUTE_LAYER_ID)) {
+            return;
+        }
+
+        const clampedProgress = Math.max(0.001, Math.min(1, progress));
+
+        try {
+            map.setPaintProperty(ROUTE_LAYER_ID, 'line-gradient', [
+                'interpolate',
+                ['linear'],
+                ['line-progress'],
+                0,
+                'rgba(0, 133, 102, 0)',
+                clampedProgress,
+                ROUTE_COLOR
+            ]);
+        } catch (error) {
+            console.warn('Unable to apply line gradient animation:', error);
+            canUseLineGradient = false;
+        }
+    }
+
+    function applyRouteStyling() {
+        if (!routeLayerReady || !map.getLayer(ROUTE_LAYER_ID)) {
+            return;
+        }
+        try {
+            map.setPaintProperty(ROUTE_LAYER_ID, 'line-color', ROUTE_COLOR);
+        } catch (error) {
+            console.warn('Unable to set route color:', error);
+        }
+    }
+
+    function applyLayerVisibility(layerId, visible) {
+        if (!map || !map.getLayer(layerId)) {
+            return;
+        }
+        const visibility = visible ? 'visible' : 'none';
+        map.setLayoutProperty(layerId, 'visibility', visibility);
+    }
+
+    function flushPendingLayerVisibility() {
+        pendingLayerVisibility.forEach((visible, layerId) => {
+            applyLayerVisibility(layerId, visible);
+        });
+    }
+
+    function setLayerOpacity(layerId, opacity) {
+        if (!map || !map.getLayer(layerId)) {
+            return;
+        }
+
+        const layer = map.getLayer(layerId);
+        const paintPropsByType = {
+            line: ['line-opacity'],
+            fill: ['fill-opacity'],
+            circle: ['circle-opacity'],
+            symbol: ['icon-opacity', 'text-opacity']
+        };
+
+        const props = paintPropsByType[layer.type] || [];
+        props.forEach((prop) => {
+            if (map.getPaintProperty(layerId, prop) !== undefined) {
+                map.setPaintProperty(layerId, prop, opacity);
+            }
+        });
     }
 
     function enableExploreMode() {
         // Simply dispatch the explore mode event
         // The overlay removal and control fade-in will be handled by App.svelte
         dispatch('mapStatus', { type: 'exploreMode' });
+        EXPLORE_LAYER_IDS.forEach((layerId) => setLayerOpacity(layerId, 0.8));
     }
 
     function setupLastTextboxObserver() {
-        const lastTextbox = document.querySelector('#position-3 .textbox');
+        const lastTextbox = document.querySelector('#position-4 .textbox');
 
         if (!lastTextbox) return;
 
@@ -111,6 +349,13 @@
                             easing: (t) => t * (2 - t)
                         });
 
+                        // Update route display based on chapter's maxRouteIncrement
+                        if (chapter.maxRouteIncrement !== undefined) {
+                            updateRoutesDisplay(chapter.maxRouteIncrement, {
+                                duration: chapter.routeAnimationDuration
+                            });
+                        }
+
                         document.querySelectorAll('.scrollytelling section').forEach((section) => {
                             section.classList.remove('active');
                         });
@@ -127,6 +372,15 @@
 
     onMount(() => {
         initializeMap();
+    });
+
+    onDestroy(() => {
+        if (routeAnimationFrame) {
+            cancelAnimationFrame(routeAnimationFrame);
+        }
+        if (scrollDebounceTimer) {
+            clearTimeout(scrollDebounceTimer);
+        }
     });
 </script>
 
