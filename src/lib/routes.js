@@ -5,7 +5,7 @@ export const chapters = {
         pitch: 60,
         duration: 5000,
         zoom: 10,
-        zoomDesktop: 11,
+        zoomDesktop: 10,
         maxRouteIncrement: 6,
         routeAnimationDuration: 9000,
         initialRouteDelay: 600
@@ -16,7 +16,7 @@ export const chapters = {
         pitch: 50,
         duration: 6000,
         zoom: 9,
-        zoomDesktop: 10,
+        zoomDesktop: 9,
         maxRouteIncrement: 13,
         routeAnimationDuration: 5000
     },
@@ -26,7 +26,7 @@ export const chapters = {
         pitch: 55,
         duration: 4000,
         zoom: 10,
-        zoomDesktop: 11,
+        zoomDesktop: 10,
         maxRouteIncrement: 17,
         routeAnimationDuration: 3800
     },
@@ -36,7 +36,7 @@ export const chapters = {
         pitch: 60,
         duration: 6000,
         zoom: 11,
-        zoomDesktop: 12.5,
+        zoomDesktop: 11.5,
         maxRouteIncrement: 20,
         routeAnimationDuration: 4200
     },
@@ -46,7 +46,7 @@ export const chapters = {
         pitch: 0,
         duration: 5000,
         zoom: 6.5,
-        zoomDesktop: 8,
+        zoomDesktop: 7,
         maxRouteIncrement: 100,
         routeAnimationDuration: 6000
     }

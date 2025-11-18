@@ -1,6 +1,10 @@
 <script>
     import { onMount, onDestroy, createEventDispatcher } from 'svelte';
-    import { chapters } from './routes.js';
+    import { chapters } from '../lib/routes.js';
+    import { hotspots } from '../lib/hotspots.js';
+
+    // Props
+    export let mode = 'storytelling'; // 'interactive' or 'storytelling'
 
     const dispatch = createEventDispatcher();
     let map;
@@ -11,16 +15,17 @@
         1,
         ...Object.values(chapters).map((chapter) => chapter.maxRouteIncrement ?? 0)
     );
-    let currentChapter = 'position-0';
+    let currentChapter = mode === 'interactive' ? 'position-4' : 'position-0';
     let lastScrollStep = null;
     let scrollDebounceTimer = null;
     let navigationControl = null;
     let lastTextboxObserver = null;
-    let currentMaxIncrement = 0;
+    let currentMaxIncrement = mode === 'interactive' ? 100 : 0;
     let routeLayerReady = false;
     let routeAnimationFrame = null;
     let canUseLineGradient = false;
     const pendingLayerVisibility = new Map();
+    const hotspotMarkers = [];
 
     export function setLayerVisibility(layerId, visible) {
         pendingLayerVisibility.set(layerId, visible);
@@ -30,8 +35,8 @@
     async function initializeMap() {
         window.maptilersdk.config.apiKey = 'L1pxMIEc78RDmw6G2tIP';
 
-        // Get initial position from chapters
-        const initialChapter = chapters['position-0'];
+        // Get initial position based on mode
+        const initialChapter = mode === 'interactive' ? chapters['position-4'] : chapters['position-0'];
 
         const isMobileDevice = window.innerWidth <= 768;
         const overviewChapter = chapters['position-4'];
@@ -59,31 +64,260 @@
 
         await map.onReadyAsync();
 
-        // Add navigation controls (initially hidden via CSS)
+        // Add navigation controls to top-left
         navigationControl = new window.maptilersdk.NavigationControl({
             visualizePitch: true
         });
-        map.addControl(navigationControl, 'top-right');
+        map.addControl(navigationControl, 'top-left');
 
         // Load and add routes GeoJSON
         await ensureRouteLayer();
         evaluateLineGradientSupport();
         applyRouteStyling();
-        applyRouteFilter(0);
+
+        // Set initial route filter based on mode
+        const initialMaxIncrement = mode === 'interactive' ? 100 : 0;
+        applyRouteFilter(initialMaxIncrement);
+
         flushPendingLayerVisibility();
 
         dispatch('mapStatus', { type: 'load' });
-        setupScrollytelling();
 
-        // Trigger initial route display after loader finishes.
-        if (initialChapter.maxRouteIncrement !== undefined) {
-            const initialRouteDelay = initialChapter.initialRouteDelay ?? 3000;
-            setTimeout(() => {
-                updateRoutesDisplay(initialChapter.maxRouteIncrement, {
-                    duration: initialChapter.routeAnimationDuration
-                });
-            }, initialRouteDelay);
+        // Only setup scrollytelling for storytelling mode
+        if (mode === 'storytelling') {
+            setupScrollytelling();
+
+            // Trigger initial route display after loader finishes
+            if (initialChapter.maxRouteIncrement !== undefined) {
+                const initialRouteDelay = initialChapter.initialRouteDelay ?? 3000;
+                setTimeout(() => {
+                    updateRoutesDisplay(initialChapter.maxRouteIncrement, {
+                        duration: initialChapter.routeAnimationDuration
+                    });
+                }, initialRouteDelay);
+            }
+        } else if (mode === 'interactive') {
+            // Add hotspots only in interactive mode
+            setupHotspotsLayer();
         }
+    }
+
+    function setupHotspotsLayer() {
+        if (map.getSource('hotspots-geojson')) {
+            return; // Already setup
+        }
+
+        // Create GeoJSON object in memory from the imported hotspots
+        const hotspotsGeoJSON = {
+            type: 'FeatureCollection',
+            features: hotspots.map(hotspot => ({
+                type: 'Feature',
+                id: hotspot.id, // Ensure each feature has a unique ID
+                geometry: {
+                    type: 'Point',
+                    coordinates: hotspot.coordinates
+                },
+                properties: {
+                    id: hotspot.id,
+                    title: hotspot.title
+                }
+            }))
+        };
+
+        map.addSource('hotspots-geojson', {
+            type: 'geojson',
+            data: hotspotsGeoJSON,
+            promoteId: 'id' // Promote the feature's 'id' property for feature state
+        });
+
+        // Add outer glow layer for depth
+        map.addLayer({
+            id: 'hotspots-glow',
+            type: 'circle',
+            source: 'hotspots-geojson',
+            paint: {
+                'circle-radius': [
+                    'case',
+                    ['boolean', ['feature-state', 'click'], false],
+                    24,
+                    ['boolean', ['feature-state', 'hover'], false],
+                    22,
+                    18
+                ],
+                'circle-color': 'rgba(0, 133, 102, 0)',
+                'circle-blur': 1,
+                'circle-opacity': [
+                    'case',
+                    ['boolean', ['feature-state', 'click'], false],
+                    0.5,
+                    ['boolean', ['feature-state', 'hover'], false],
+                    0.4,
+                    0.25
+                ],
+                'circle-stroke-color': ROUTE_COLOR,
+                'circle-stroke-width': [
+                    'case',
+                    ['boolean', ['feature-state', 'click'], false],
+                    3,
+                    ['boolean', ['feature-state', 'hover'], false],
+                    2.5,
+                    1.5
+                ],
+                'circle-stroke-opacity': [
+                    'case',
+                    ['boolean', ['feature-state', 'hover'], false],
+                    0.6,
+                    0.35
+                ],
+                'circle-pitch-alignment': 'map',
+                'circle-radius-transition': { duration: 300, delay: 0 },
+                'circle-opacity-transition': { duration: 300, delay: 0 },
+                'circle-stroke-width-transition': { duration: 300, delay: 0 }
+            }
+        });
+
+        // Main marker layer
+        map.addLayer({
+            id: 'hotspots-layer',
+            type: 'circle',
+            source: 'hotspots-geojson',
+            paint: {
+                'circle-radius': [
+                    'case',
+                    ['boolean', ['feature-state', 'click'], false],
+                    13,
+                    ['boolean', ['feature-state', 'hover'], false],
+                    12,
+                    10
+                ],
+                'circle-color': '#EB0000',
+                'circle-stroke-color': '#FDFDFB', // Swiss snow white border
+                'circle-stroke-width': [
+                    'case',
+                    ['boolean', ['feature-state', 'click'], false],
+                    3.5,
+                    ['boolean', ['feature-state', 'hover'], false],
+                    3,
+                    2.5
+                ],
+                'circle-opacity': 1,
+                'circle-stroke-opacity': 1,
+                'circle-pitch-alignment': 'map',
+                'circle-radius-transition': { duration: 300, delay: 0 },
+                'circle-stroke-width-transition': { duration: 300, delay: 0 }
+            }
+        });
+
+        // Inner dot for railway precision detail
+        map.addLayer({
+            id: 'hotspots-center',
+            type: 'circle',
+            source: 'hotspots-geojson',
+            paint: {
+                'circle-radius': [
+                    'case',
+                    ['boolean', ['feature-state', 'click'], false],
+                    4,
+                    ['boolean', ['feature-state', 'hover'], false],
+                    3.5,
+                    3
+                ],
+                'circle-color': '#FDFDFB',
+                'circle-opacity': 0.9,
+                'circle-pitch-alignment': 'map',
+                'circle-radius-transition': { duration: 300, delay: 0 }
+            }
+        });
+
+        let hoveredHotspotId = null;
+
+        // Unified hover handler for all hotspot layers
+        const handleHotspotHover = (e) => {
+            if (e.features.length > 0) {
+                map.getCanvas().style.cursor = 'pointer';
+                if (hoveredHotspotId !== null) {
+                    map.setFeatureState(
+                        { source: 'hotspots-geojson', id: hoveredHotspotId },
+                        { hover: false }
+                    );
+                }
+                hoveredHotspotId = e.features[0].id;
+                map.setFeatureState(
+                    { source: 'hotspots-geojson', id: hoveredHotspotId },
+                    { hover: true }
+                );
+            }
+        };
+
+        const handleHotspotLeave = () => {
+            map.getCanvas().style.cursor = '';
+            if (hoveredHotspotId !== null) {
+                map.setFeatureState(
+                    { source: 'hotspots-geojson', id: hoveredHotspotId },
+                    { hover: false }
+                );
+            }
+            hoveredHotspotId = null;
+        };
+
+        // Apply hover handlers to all layers
+        ['hotspots-glow', 'hotspots-layer', 'hotspots-center'].forEach(layerId => {
+            map.on('mousemove', layerId, handleHotspotHover);
+            map.on('mouseleave', layerId, handleHotspotLeave);
+        });
+
+        map.on('click', 'hotspots-layer', (e) => {
+            const feature = e.features[0];
+            const coordinates = feature.geometry.coordinates.slice();
+            const hotspotData = hotspots.find(h => h.id === feature.properties.id);
+            
+            if (!hotspotData) return;
+
+            // Click animation
+            map.setFeatureState(
+                { source: 'hotspots-geojson', id: feature.id },
+                { click: true }
+            );
+            setTimeout(() => {
+                map.setFeatureState(
+                    { source: 'hotspots-geojson', id: feature.id },
+                    { click: false }
+                );
+            }, 300);
+
+            const popupContent = `
+                <div class="hotspot-popup">
+                    <img src="${hotspotData.image}" alt="${hotspotData.title}" class="hotspot-image" />
+                    <h3 class="hotspot-title">${hotspotData.title}</h3>
+                    <p class="hotspot-description">${hotspotData.description}</p>
+                </div>
+            `;
+
+            while (Math.abs(e.lngLat.lng - coordinates[0]) > 180) {
+                coordinates[0] += e.lngLat.lng > coordinates[0] ? 360 : -360;
+            }
+
+            const isMobile = window.innerWidth <= 768;
+            const popup = new window.maptilersdk.Popup({
+                maxWidth: '320px',
+                className: isMobile ? 'hotspot-popup-container hotspot-popup-mobile' : 'hotspot-popup-container',
+            })
+                .setLngLat(coordinates)
+                .setHTML(popupContent)
+                .addTo(map);
+
+            // Add backdrop blur for mobile
+            if (isMobile) {
+                const backdropDiv = document.createElement('div');
+                backdropDiv.className = 'hotspot-popup-backdrop';
+                map.getCanvasContainer().appendChild(backdropDiv);
+
+                // Remove backdrop when popup closes
+                popup.on('close', () => {
+                    backdropDiv.remove();
+                });
+            }
+        });
     }
 
     async function ensureRouteLayer() {
@@ -279,7 +513,8 @@
         // Simply dispatch the explore mode event
         // The overlay removal and control fade-in will be handled by App.svelte
         dispatch('mapStatus', { type: 'exploreMode' });
-        EXPLORE_LAYER_IDS.forEach((layerId) => setLayerOpacity(layerId, 0.8));
+        setLayerOpacity('lines', 0.75); // Railways at 75%
+        setLayerOpacity('SBB', 0.8); // Stations at 80%
     }
 
     function setupLastTextboxObserver() {
@@ -365,9 +600,6 @@
             });
 
         window.addEventListener('resize', scroller.resize);
-
-        // Set up IntersectionObserver to watch for last textbox exit
-        setupLastTextboxObserver();
     }
 
     onMount(() => {
@@ -381,10 +613,12 @@
         if (scrollDebounceTimer) {
             clearTimeout(scrollDebounceTimer);
         }
+        // Clean up hotspot markers
+        hotspotMarkers.forEach(marker => marker.remove());
     });
 </script>
 
-<div id="map"></div>
+<div id="map" class={mode === 'interactive' ? 'interactive-mode' : 'storytelling-mode'}></div>
 
 <style>
     #map {
@@ -395,7 +629,14 @@
         height: 100vh;
     }
 
-    :global(.maplibregl-ctrl-top-right) {
+    /* In storytelling mode, hide controls initially */
+    :global(.storytelling-mode .maplibregl-ctrl-top-left) {
         display: none;
+    }
+
+    /* In interactive mode, show controls immediately */
+    :global(.interactive-mode .maplibregl-ctrl-top-left) {
+        display: block;
+        opacity: 1;
     }
 </style>
